@@ -25,7 +25,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          # 不启用 cache: npm（避免仓库没有 package-lock.json/yarn.lock 时直接失败）
 
       - name: Install dependencies
         run: npm install
@@ -52,7 +52,6 @@ jobs:
 
       - name: Build app (electron-builder)
         env:
-          # 在 CI 中明确不发布，只生成本地产物
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist -- --publish never
 
