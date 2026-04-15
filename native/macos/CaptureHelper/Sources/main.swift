@@ -4,10 +4,6 @@ import CoreMedia
 import AVFoundation
 import CoreVideo
 
-// 约定输出：PCM s16le / 48kHz / 2ch（交错 interleaved）
-// - helper 通过 stdout 持续输出裸 PCM
-// - 收到 SIGINT/SIGTERM 或 stdin 关闭时停止
-
 final class StopFlag {
     static let shared = StopFlag()
     private let lock = NSLock()
@@ -25,7 +21,6 @@ func installSignalHandlers() {
     signal(SIGINT) { _ in StopFlag.shared.stop() }
     signal(SIGTERM) { _ in StopFlag.shared.stop() }
 
-    // 如果父进程关闭 stdin，也会触发 EOF；我们用后台线程读取 stdin 来感知
     DispatchQueue.global(qos: .background).async {
         var buf = [UInt8](repeating: 0, count: 1)
         while true {
@@ -62,167 +57,12 @@ final class AudioPcmWriter: NSObject, SCStreamOutput {
         let isSignedInt = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0
         let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
 
-        // 采样率不为 48k 时仅提示；最终仍由 Node/ffmpeg 端兜底重采样
         if inSampleRate != 48_000 {
-            fputs("警告：ScreenCaptureKit 输出采样率为 \(inSampleRate)Hz（期望 48000Hz）。编码层会做重采样兜底。\n", stderr)
+            fputs("警告：输出采样率为 \(inSampleRate)Hz（期望 48000Hz），编码层会重采样兜底。\n", stderr)
         }
 
         var audioBufferList = AudioBufferList(
             mNumberBuffers: 0,
             mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
         )
-        var blockBuffer: CMBlockBuffer?
-        var sizeNeeded: Int = 0
-
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: &sizeNeeded,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: kCFAllocatorDefault,
-            blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr else { return }
-
-        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-        if frameCount <= 0 { return }
-
-        // 输出统一成：交错 stereo Int16
-        let outChannels = 2
-        tmpInterleavedI16.removeAll(keepingCapacity: true)
-        tmpInterleavedI16.reserveCapacity(frameCount * outChannels)
-
-        let buffersCount = Int(audioBufferList.mNumberBuffers)
-        if buffersCount <= 0 { return }
-
-        func writeInterleavedStereoFromInterleavedF32(_ basePtr: UnsafeRawPointer) {
-            let fPtr = basePtr.assumingMemoryBound(to: Float.self)
-            for i in 0..<frameCount {
-                let left: Float
-                let right: Float
-                if inChannels == 1 {
-                    left = fPtr[i]
-                    right = left
-                } else {
-                    left = fPtr[i * inChannels]
-                    right = fPtr[i * inChannels + 1]
-                }
-                tmpInterleavedI16.append(Int16(clamping: Int(clamp(left) * 32767.0)))
-                tmpInterleavedI16.append(Int16(clamping: Int(clamp(right) * 32767.0)))
-            }
-        }
-
-        func writeInterleavedStereoFromInterleavedI16(_ basePtr: UnsafeRawPointer) {
-            let sPtr = basePtr.assumingMemoryBound(to: Int16.self)
-            for i in 0..<frameCount {
-                let left: Int16
-                let right: Int16
-                if inChannels == 1 {
-                    left = sPtr[i]
-                    right = left
-                } else {
-                    left = sPtr[i * inChannels]
-                    right = sPtr[i * inChannels + 1]
-                }
-                tmpInterleavedI16.append(left)
-                tmpInterleavedI16.append(right)
-            }
-        }
-
-        if isNonInterleaved {
-            // 非交错：每个 buffer 是一个声道（常见为 Float32 planar）
-            withUnsafePointer(to: &audioBufferList) { ablPtr in
-                let base = UnsafeRawPointer(ablPtr).advanced(by: MemoryLayout<UInt32>.size)
-                for i in 0..<frameCount {
-                    let l: Float
-                    let r: Float
-                    let buf0 = base.load(fromByteOffset: 0 * MemoryLayout<AudioBuffer>.size, as: AudioBuffer.self)
-                    let buf1 = (inChannels >= 2 && buffersCount >= 2)
-                        ? base.load(fromByteOffset: 1 * MemoryLayout<AudioBuffer>.size, as: AudioBuffer.self)
-                        : buf0
-                    guard let d0 = buf0.mData else { return }
-                    guard let d1 = buf1.mData else { return }
-
-                    if isFloat {
-                        let p0 = d0.assumingMemoryBound(to: Float.self)
-                        let p1 = d1.assumingMemoryBound(to: Float.self)
-                        l = p0[i]
-                        r = p1[i]
-                        tmpInterleavedI16.append(Int16(clamping: Int(clamp(l) * 32767.0)))
-                        tmpInterleavedI16.append(Int16(clamping: Int(clamp(r) * 32767.0)))
-                    } else if isSignedInt && asbd.mBitsPerChannel == 16 {
-                        let p0 = d0.assumingMemoryBound(to: Int16.self)
-                        let p1 = d1.assumingMemoryBound(to: Int16.self)
-                        tmpInterleavedI16.append(p0[i])
-                        tmpInterleavedI16.append(p1[i])
-                    } else {
-                        return
-                    }
-                }
-            }
-        } else {
-            // 交错：通常单 buffer
-            let buf0 = audioBufferList.mBuffers
-            guard let data = buf0.mData else { return }
-
-            if isFloat && asbd.mBitsPerChannel == 32 {
-                writeInterleavedStereoFromInterleavedF32(data)
-            } else if isSignedInt && asbd.mBitsPerChannel == 16 {
-                writeInterleavedStereoFromInterleavedI16(data)
-            } else {
-                return
-            }
-        }
-
-        let byteCount = tmpInterleavedI16.count * MemoryLayout<Int16>.size
-        tmpInterleavedI16.withUnsafeBytes { raw in
-            out.write(Data(raw[0..<byteCount]))
-        }
-    }
-}
-
-@main
-struct CaptureHelperMain {
-    static func main() async {
-        setvbuf(stdout, nil, _IONBF, 0)
-        installSignalHandlers()
-
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else {
-                fputs("错误：未找到可用显示器。\n", stderr)
-                exit(2)
-            }
-
-            let filter = SCContentFilter(display: display, excludingWindows: [])
-            let config = SCStreamConfiguration()
-            config.capturesAudio = true
-
-            // ScreenCaptureKit 没有 capturesVideo 开关；即使只监听音频，也给最小视频配置以兼容部分系统版本
-            config.width = 2
-            config.height = 2
-            config.pixelFormat = kCVPixelFormatType_32BGRA
-
-            // 尽量请求 48kHz/2ch（不同系统版本属性名可能不同；用 KVC 兼容）
-            config.setValue(48_000, forKey: "audioSampleRate")
-            config.setValue(2, forKey: "audioChannelCount")
-
-            let writer = AudioPcmWriter()
-            let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-
-            try stream.addStreamOutput(writer, type: .audio, sampleHandlerQueue: DispatchQueue(label: "audio.queue"))
-            try await stream.startCapture()
-
-            while !StopFlag.shared.stopped {
-                try await Task.sleep(nanoseconds: 150_000_000)
-            }
-
-            await stream.stopCapture()
-        } catch {
-            fputs("错误：\(error)\n", stderr)
-            exit(1)
-        }
-    }
-}
+        var blockBuffer
