@@ -1,0 +1,66 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Setup Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build capture-helper (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd native/macos/CaptureHelper
+          swift build -c release
+          mkdir -p ../../bin
+          cp -f .build/release/capture-helper ../../bin/capture-helper
+
+      - name: Build capture-helper (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd native/windows/capture-helper
+          cargo build --release
+          mkdir -p ../../bin
+          cp -f target/release/capture-helper.exe ../../bin/capture-helper.exe
+
+      - name: Build app (electron-builder)
+        env:
+          # 在 CI 中明确不发布，只生成本地产物
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist -- --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SystemAudioCapture-${{ runner.os }}
+          path: |
+            dist/**
+            !dist/builder-debug.yml
+            !dist/builder-effective-config.yaml

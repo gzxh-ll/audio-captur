@@ -1,0 +1,58 @@
+{
+  "name": "system-audio-capture-app",
+  "version": "0.1.0",
+  "description": "Windows/macOS system audio capture (10-15s) -> MP3, with global hotkey and minimal overlay UI",
+  "main": "src/main/main.js",
+  "author": "",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "lint": "node -c src/main/main.js && node -c src/main/recorder.js && node -c src/main/helpers.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0",
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.example.systemaudiocapture",
+    "productName": "SystemAudioCapture",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "native/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "native/bin",
+        "to": "native/bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "extendInfo": {
+        "LSUIElement": true
+      },
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    }
+  }
+}

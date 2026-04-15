@@ -1,0 +1,19 @@
+[package]
+name = "capture-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+ctrlc = "3"
+windows = { version = "0.56", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_Media_Audio",
+  "Win32_Media_KernelStreaming",
+  "Win32_System_Threading"
+] }
+
+# 说明：
+# Windows 真实实现建议使用 WASAPI loopback 捕获默认输出设备，
+# 将 PCM 统一到 s16le/48kHz/2ch 后写入 stdout。
