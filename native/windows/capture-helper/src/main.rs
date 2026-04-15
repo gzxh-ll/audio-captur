@@ -165,4 +165,46 @@ fn main() -> Result<()> {
                     }
                 } else if tag == WAVE_FORMAT_PCM && in_bps == 16 {
                     let sptr = data_ptr as *const i16;
-                    for i in 
+                    for i in 0..(num_frames as usize) {
+                        let base = i * (in_channels as usize);
+                        let l = (*sptr.add(base) as f32) / 32768.0;
+                        let r = if in_channels >= 2 {
+                            (*sptr.add(base + 1) as f32) / 32768.0
+                        } else {
+                            l
+                        };
+                        stereo_f32.push((l, r));
+                    }
+                } else {
+                    capture_client.ReleaseBuffer(num_frames).ok();
+                    return Err(anyhow!(
+                        "不支持的混音格式：tag={}, bits={}, ch={}, sr={}",
+                        tag,
+                        in_bps,
+                        in_channels,
+                        in_sr
+                    ));
+                }
+
+                let stereo_48k = resample_linear_stereo(&stereo_f32, in_sr, 48_000);
+                let bytes = to_i16_bytes_stereo(&stereo_48k);
+                let _ = stdout.write_all(&bytes);
+
+                capture_client
+                    .ReleaseBuffer(num_frames)
+                    .context("ReleaseBuffer 失败")?;
+
+                packet_len = capture_client
+                    .GetNextPacketSize()
+                    .context("GetNextPacketSize 失败")?;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        audio_client.Stop().ok();
+        CoTaskMemFree(Some(pwfx as _));
+    }
+
+    Ok(())
+}
