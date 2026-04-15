@@ -5,16 +5,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use windows::core::GUID;
 use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_NOPERSIST, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_EXTENSIBLE,
-    WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
+    AUDCLNT_SHAREMODE, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+
+// 为避免 windows-rs 不同版本/特性导致某些常量名缺失（E0432）或底层类型变化（u32/i32）
+// 这里把关键常量用数值固定下来，保证在 windows = "0.56" 下更稳。
+const CLSID_MMDEVICE_ENUMERATOR: GUID =
+    GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
+
+const SHAREMODE_SHARED: AUDCLNT_SHAREMODE = AUDCLNT_SHAREMODE(0);
+
+// IAudioClient::Initialize 的 streamflags (u32)
+const STREAMFLAGS_LOOPBACK: u32 = 0x0002_0000;
+const STREAMFLAGS_NOPERSIST: u32 = 0x0008_0000;
+
+// IAudioCaptureClient::GetBuffer 的 flags (DWORD)
+const BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
+
+// wave format tags
+const WAVE_FORMAT_PCM: u32 = 0x0001;
+const WAVE_FORMAT_IEEE_FLOAT: u32 = 0x0003;
+const WAVE_FORMAT_EXTENSIBLE: u32 = 0xFFFE;
 
 fn clamp1(x: f32) -> f32 {
     x.max(-1.0).min(1.0)
@@ -67,8 +85,8 @@ fn to_i16_bytes_stereo(frames: &[(f32, f32)]) -> Vec<u8> {
 
 unsafe fn get_default_render_device() -> Result<IMMDevice> {
     let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&IMMDeviceEnumerator::IID, None, CLSCTX_ALL)
-            .context("CoCreateInstance(IMMDeviceEnumerator) 失败")?;
+        CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, None, CLSCTX_ALL)
+            .context("CoCreateInstance(MMDeviceEnumerator) 失败")?;
     let dev = enumerator
         .GetDefaultAudioEndpoint(eRender, eConsole)
         .context("GetDefaultAudioEndpoint 失败")?;
@@ -87,9 +105,11 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16, u32, 
     let bps = wfx.wBitsPerSample;
 
     if tag_u32 == WAVE_FORMAT_EXTENSIBLE {
-        let _ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        // WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM 的 GUID 判断较繁琐；
-        // 这里依赖 wBitsPerSample 和常见 mixformat 组合做判定（足够用于大多数设备）。
+        // WAVEFORMATEXTENSIBLE 的子格式 GUID 判断较繁琐；
+        // 对于大多数设备，mix format 常见为：
+        // - 32-bit float -> IEEE_FLOAT
+        // - 16-bit PCM   -> PCM
+        // 我们按 bits 做推断，足够满足 10–15 秒工具录制。
         let inferred_tag = if bps == 32 {
             WAVE_FORMAT_IEEE_FLOAT
         } else {
@@ -102,7 +122,6 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16, u32, 
 }
 
 fn main() -> Result<()> {
-    // 捕获 Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -116,8 +135,9 @@ fn main() -> Result<()> {
         CoInitializeEx(None, COINIT_MULTITHREADED).context("CoInitializeEx 失败")?;
 
         let device = get_default_render_device()?;
+        // IMMDevice::Activate 的第二个参数是 Option<*const PROPVARIANT>，这里应传 None
         let audio_client: IAudioClient = device
-            .Activate(CLSCTX_ALL, null_mut())
+            .Activate::<IAudioClient>(CLSCTX_ALL, None)
             .context("IMMDevice.Activate(IAudioClient) 失败")?;
 
         let mut pwfx: *mut WAVEFORMATEX = null_mut();
@@ -129,22 +149,21 @@ fn main() -> Result<()> {
         }
         let (tag, in_channels, in_sr, in_bps) = parse_mix_format(pwfx)?;
 
-        // shared + loopback
-        // buffer duration: 100ms
-        let hns_buffer_duration: i64 = 100_0000; // 100ms in 100ns units = 1,000,000
+        let hns_buffer_duration: i64 = 1_000_000; // 100ms
         audio_client
             .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                SHAREMODE_SHARED,
+                STREAMFLAGS_LOOPBACK | STREAMFLAGS_NOPERSIST,
                 hns_buffer_duration,
                 0,
                 pwfx,
-                null_mut(),
+                // windows-rs 0.56: Option<*const GUID>
+                None,
             )
             .context("IAudioClient.Initialize 失败")?;
 
         let capture_client: IAudioCaptureClient = audio_client
-            .GetService()
+            .GetService::<IAudioCaptureClient>()
             .context("GetService(IAudioCaptureClient) 失败")?;
 
         audio_client.Start().context("IAudioClient.Start 失败")?;
@@ -161,8 +180,7 @@ fn main() -> Result<()> {
                 let mut num_frames: u32 = 0;
                 let mut flags: u32 = 0;
 
-                // windows-rs 0.56：GetBuffer 最后两个参数是 Option<*mut u64>
-                // 为避免你之前遇到的类型不匹配，这里显式传 Some(ptr)（最稳）
+                // windows-rs: Option<*mut u64>，显式 Some(ptr) 最稳
                 let mut dev_pos: u64 = 0;
                 let mut qpc_pos: u64 = 0;
 
@@ -176,7 +194,7 @@ fn main() -> Result<()> {
                     )
                     .context("GetBuffer 失败")?;
 
-                let silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0;
+                let silent = (flags & BUFFERFLAGS_SILENT) != 0;
 
                 let mut stereo_f32: Vec<(f32, f32)> = Vec::with_capacity(num_frames as usize);
 
