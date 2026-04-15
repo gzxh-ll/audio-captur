@@ -122,6 +122,7 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16, u32, 
 }
 
 fn main() -> Result<()> {
+    // 捕获 Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -132,7 +133,10 @@ fn main() -> Result<()> {
     }
 
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED).context("CoInitializeEx 失败")?;
+        // windows = 0.56: CoInitializeEx 返回 HRESULT（不是 Result），需要调用 .ok() 转成 Result
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .context("CoInitializeEx 失败")?;
 
         let device = get_default_render_device()?;
         // IMMDevice::Activate 的第二个参数是 Option<*const PROPVARIANT>，这里应传 None
@@ -140,15 +144,15 @@ fn main() -> Result<()> {
             .Activate::<IAudioClient>(CLSCTX_ALL, None)
             .context("IMMDevice.Activate(IAudioClient) 失败")?;
 
-        let mut pwfx: *mut WAVEFORMATEX = null_mut();
-        audio_client
-            .GetMixFormat(&mut pwfx)
-            .context("GetMixFormat 失败")?;
+        // windows = 0.56: GetMixFormat 无 out 参数，直接返回 *mut WAVEFORMATEX
+        let pwfx: *mut WAVEFORMATEX = audio_client.GetMixFormat().context("GetMixFormat 失败")?;
         if pwfx.is_null() {
             return Err(anyhow!(E_POINTER));
         }
         let (tag, in_channels, in_sr, in_bps) = parse_mix_format(pwfx)?;
 
+        // shared + loopback
+        // buffer duration: 100ms
         let hns_buffer_duration: i64 = 1_000_000; // 100ms
         audio_client
             .Initialize(
