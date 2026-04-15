@@ -75,26 +75,33 @@ unsafe fn get_default_render_device() -> Result<IMMDevice> {
     Ok(dev)
 }
 
-unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u16, u16, u32, u16)> {
+/// 解析 WAVEFORMATEX / WAVEFORMATEXTENSIBLE，返回 (tag(u32), channels, sample_rate, bits_per_sample)
+unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16, u32, u16)> {
     if pwfx.is_null() {
         return Err(anyhow!("mix format 为空"));
     }
     let wfx = &*pwfx;
-    let tag = wfx.wFormatTag;
+    let tag_u32: u32 = u32::from(wfx.wFormatTag);
     let ch = wfx.nChannels;
     let sr = wfx.nSamplesPerSec;
     let bps = wfx.wBitsPerSample;
 
-    if tag == WAVE_FORMAT_EXTENSIBLE {
+    if tag_u32 == WAVE_FORMAT_EXTENSIBLE {
         let _ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        let inferred_tag = if bps == 32 { WAVE_FORMAT_IEEE_FLOAT } else { WAVE_FORMAT_PCM };
+        // GUID 判断较繁琐；这里用 bps 推断足以覆盖常见设备
+        let inferred_tag = if bps == 32 {
+            WAVE_FORMAT_IEEE_FLOAT
+        } else {
+            WAVE_FORMAT_PCM
+        };
         return Ok((inferred_tag, ch, sr, bps));
     }
 
-    Ok((tag, ch, sr, bps))
+    Ok((tag_u32, ch, sr, bps))
 }
 
 fn main() -> Result<()> {
+    // 捕获 Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -113,13 +120,17 @@ fn main() -> Result<()> {
             .context("IMMDevice.Activate(IAudioClient) 失败")?;
 
         let mut pwfx: *mut WAVEFORMATEX = null_mut();
-        audio_client.GetMixFormat(&mut pwfx).context("GetMixFormat 失败")?;
+        audio_client
+            .GetMixFormat(&mut pwfx)
+            .context("GetMixFormat 失败")?;
         if pwfx.is_null() {
             return Err(anyhow!(E_POINTER));
         }
+
         let (tag, in_channels, in_sr, in_bps) = parse_mix_format(pwfx)?;
 
-        let hns_buffer_duration: i64 = 1_000_000; // 100ms
+        // shared + loopback
+        let hns_buffer_duration: i64 = 1_000_000; // 100ms (100ns units)
         audio_client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -145,8 +156,13 @@ fn main() -> Result<()> {
                 .context("GetNextPacketSize 失败")?;
 
             while packet_len > 0 {
-                let (data_ptr, num_frames, flags, _devpos, _qpcpos) = capture_client
-                    .GetBuffer()
+                // 关键修复：windows 0.56 的 GetBuffer 是 out 参数形式
+                let mut data_ptr: *mut u8 = null_mut();
+                let mut num_frames: u32 = 0;
+                let mut flags: u32 = 0;
+
+                capture_client
+                    .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, null_mut(), null_mut())
                     .context("GetBuffer 失败")?;
 
                 let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
@@ -186,7 +202,10 @@ fn main() -> Result<()> {
                     ));
                 }
 
+                // 重采样到 48k（线性插值）
                 let stereo_48k = resample_linear_stereo(&stereo_f32, in_sr, 48_000);
+
+                // 输出 s16le / 48k / stereo
                 let bytes = to_i16_bytes_stereo(&stereo_48k);
                 let _ = stdout.write_all(&bytes);
 
