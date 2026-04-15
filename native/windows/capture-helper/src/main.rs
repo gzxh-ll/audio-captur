@@ -1,12 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::{self, Write};
-use std::mem::{size_of, MaybeUninit};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{E_POINTER, S_OK};
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -88,10 +87,9 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u16, u16, u32, 
     let bps = wfx.wBitsPerSample;
 
     if tag == WAVE_FORMAT_EXTENSIBLE {
-        let ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        let sub = ext.SubFormat;
+        let _ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
         // WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM 的 GUID 判断较繁琐；
-        // 这里依赖 wBitsPerSample 和常见 mixformat 组合做判定（足够用于大多数设备）。
+        // 这里依赖常见 mixformat 组合做判定（大多数设备足够用）
         let inferred_tag = if bps == 32 {
             WAVE_FORMAT_IEEE_FLOAT
         } else {
@@ -133,7 +131,7 @@ fn main() -> Result<()> {
 
         // shared + loopback
         // buffer duration: 100ms
-        let hns_buffer_duration: i64 = 100_0000; // 100ms in 100ns units = 1,000,000
+        let hns_buffer_duration: i64 = 1_000_000; // 100ms in 100ns units
         audio_client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -154,85 +152,4 @@ fn main() -> Result<()> {
         let mut stdout = io::stdout().lock();
 
         while running.load(Ordering::SeqCst) {
-            let mut packet_len: u32 = 0;
-            capture_client
-                .GetNextPacketSize(&mut packet_len)
-                .context("GetNextPacketSize 失败")?;
-
-            while packet_len > 0 {
-                let mut data_ptr: *mut u8 = null_mut();
-                let mut num_frames: u32 = 0;
-                let mut flags: u32 = 0;
-
-                capture_client
-                    .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, null_mut(), null_mut())
-                    .context("GetBuffer 失败")?;
-
-                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
-
-                // 先将输入转为 f32 stereo @ in_sr
-                let mut stereo_f32: Vec<(f32, f32)> = Vec::with_capacity(num_frames as usize);
-
-                if silent || data_ptr.is_null() {
-                    stereo_f32.resize(num_frames as usize, (0.0, 0.0));
-                } else if tag == WAVE_FORMAT_IEEE_FLOAT && in_bps == 32 {
-                    let fptr = data_ptr as *const f32;
-                    for i in 0..(num_frames as usize) {
-                        let base = i * (in_channels as usize);
-                        let l = *fptr.add(base);
-                        let r = if in_channels >= 2 { *fptr.add(base + 1) } else { l };
-                        stereo_f32.push((l, r));
-                    }
-                } else if tag == WAVE_FORMAT_PCM && in_bps == 16 {
-                    let sptr = data_ptr as *const i16;
-                    for i in 0..(num_frames as usize) {
-                        let base = i * (in_channels as usize);
-                        let l = (*sptr.add(base) as f32) / 32768.0;
-                        let r = if in_channels >= 2 {
-                            (*sptr.add(base + 1) as f32) / 32768.0
-                        } else {
-                            l
-                        };
-                        stereo_f32.push((l, r));
-                    }
-                } else {
-                    // 其它格式：为了确保可编译与可用性，这里直接报错
-                    capture_client.ReleaseBuffer(num_frames).ok();
-                    return Err(anyhow!(
-                        "不支持的混音格式：tag={}, bits={}, ch={}, sr={}",
-                        tag,
-                        in_bps,
-                        in_channels,
-                        in_sr
-                    ));
-                }
-
-                // 声道规范化：若 >2 声道，当前实现取前两声道；若 1 声道则复制
-                //（上面已处理）
-
-                // 采样率规范化到 48k（简单线性插值，足够用于 10–15s 工具录制）
-                let out_sr = 48_000u32;
-                let stereo_48k = resample_linear_stereo(&stereo_f32, in_sr, out_sr);
-
-                // 输出 s16le / 48k / stereo
-                let bytes = to_i16_bytes_stereo(&stereo_48k);
-                stdout.write_all(&bytes).ok();
-
-                capture_client
-                    .ReleaseBuffer(num_frames)
-                    .context("ReleaseBuffer 失败")?;
-
-                capture_client
-                    .GetNextPacketSize(&mut packet_len)
-                    .context("GetNextPacketSize 失败")?;
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        audio_client.Stop().ok();
-        CoTaskMemFree(Some(pwfx as _));
-    }
-
-    Ok(())
-}
+            let mut packet_len: u32 = capture_client
