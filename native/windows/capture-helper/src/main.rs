@@ -29,7 +29,7 @@ fn resample_linear_stereo(in_lr: &[(f32, f32)], in_sr: u32, out_sr: u32) -> Vec<
     let mut out = Vec::with_capacity(out_len);
 
     for oi in 0..out_len {
-        let pos = (oi as f64) / ratio;
+        let pos = (oi as f64) / ratio; // in index
         let i0 = pos.floor() as isize;
         let i1 = i0 + 1;
         let frac = (pos - (i0 as f64)) as f32;
@@ -88,7 +88,8 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16, u32, 
 
     if tag_u32 == WAVE_FORMAT_EXTENSIBLE {
         let _ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        // GUID 判断较繁琐；这里用 bps 推断足以覆盖常见设备
+        // WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM 的 GUID 判断较繁琐；
+        // 这里依赖 wBitsPerSample 和常见 mixformat 组合做判定（足够用于大多数设备）。
         let inferred_tag = if bps == 32 {
             WAVE_FORMAT_IEEE_FLOAT
         } else {
@@ -126,11 +127,11 @@ fn main() -> Result<()> {
         if pwfx.is_null() {
             return Err(anyhow!(E_POINTER));
         }
-
         let (tag, in_channels, in_sr, in_bps) = parse_mix_format(pwfx)?;
 
         // shared + loopback
-        let hns_buffer_duration: i64 = 1_000_000; // 100ms (100ns units)
+        // buffer duration: 100ms
+        let hns_buffer_duration: i64 = 100_0000; // 100ms in 100ns units = 1,000,000
         audio_client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -156,13 +157,23 @@ fn main() -> Result<()> {
                 .context("GetNextPacketSize 失败")?;
 
             while packet_len > 0 {
-                // 关键修复：windows 0.56 的 GetBuffer 是 out 参数形式
                 let mut data_ptr: *mut u8 = null_mut();
                 let mut num_frames: u32 = 0;
                 let mut flags: u32 = 0;
 
+                // windows-rs 0.56：GetBuffer 最后两个参数是 Option<*mut u64>
+                // 为避免你之前遇到的类型不匹配，这里显式传 Some(ptr)（最稳）
+                let mut dev_pos: u64 = 0;
+                let mut qpc_pos: u64 = 0;
+
                 capture_client
-                    .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, null_mut(), null_mut())
+                    .GetBuffer(
+                        &mut data_ptr,
+                        &mut num_frames,
+                        &mut flags,
+                        Some(&mut dev_pos as *mut u64),
+                        Some(&mut qpc_pos as *mut u64),
+                    )
                     .context("GetBuffer 失败")?;
 
                 let silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0;
@@ -202,12 +213,11 @@ fn main() -> Result<()> {
                     ));
                 }
 
-                // 重采样到 48k（线性插值）
-                let stereo_48k = resample_linear_stereo(&stereo_f32, in_sr, 48_000);
+                let out_sr = 48_000u32;
+                let stereo_48k = resample_linear_stereo(&stereo_f32, in_sr, out_sr);
 
-                // 输出 s16le / 48k / stereo
                 let bytes = to_i16_bytes_stereo(&stereo_48k);
-                let _ = stdout.write_all(&bytes);
+                stdout.write_all(&bytes).ok();
 
                 capture_client
                     .ReleaseBuffer(num_frames)
