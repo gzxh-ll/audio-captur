@@ -165,7 +165,7 @@ fn main() -> Result<()> {
                     .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, null_mut(), null_mut())
                     .context("GetBuffer 失败")?;
 
-                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
+                let silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0;
 
                 let mut stereo_f32: Vec<(f32, f32)> = Vec::with_capacity(num_frames as usize);
 
