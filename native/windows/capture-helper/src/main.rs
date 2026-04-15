@@ -29,7 +29,7 @@ fn resample_linear_stereo(in_lr: &[(f32, f32)], in_sr: u32, out_sr: u32) -> Vec<
     let mut out = Vec::with_capacity(out_len);
 
     for oi in 0..out_len {
-        let pos = (oi as f64) / ratio; // in index
+        let pos = (oi as f64) / ratio;
         let i0 = pos.floor() as isize;
         let i1 = i0 + 1;
         let frac = (pos - (i0 as f64)) as f32;
@@ -75,7 +75,6 @@ unsafe fn get_default_render_device() -> Result<IMMDevice> {
     Ok(dev)
 }
 
-/// 解析 WAVEFORMATEX / WAVEFORMATEXTENSIBLE，返回 (tag, channels, sample_rate, bits_per_sample)
 unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u16, u16, u32, u16)> {
     if pwfx.is_null() {
         return Err(anyhow!("mix format 为空"));
@@ -88,13 +87,7 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u16, u16, u32, 
 
     if tag == WAVE_FORMAT_EXTENSIBLE {
         let _ext = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        // WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM 的 GUID 判断较繁琐；
-        // 这里依赖常见 mixformat 组合做判定（大多数设备足够用）
-        let inferred_tag = if bps == 32 {
-            WAVE_FORMAT_IEEE_FLOAT
-        } else {
-            WAVE_FORMAT_PCM
-        };
+        let inferred_tag = if bps == 32 { WAVE_FORMAT_IEEE_FLOAT } else { WAVE_FORMAT_PCM };
         return Ok((inferred_tag, ch, sr, bps));
     }
 
@@ -102,7 +95,6 @@ unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u16, u16, u32, 
 }
 
 fn main() -> Result<()> {
-    // 捕获 Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -121,17 +113,13 @@ fn main() -> Result<()> {
             .context("IMMDevice.Activate(IAudioClient) 失败")?;
 
         let mut pwfx: *mut WAVEFORMATEX = null_mut();
-        audio_client
-            .GetMixFormat(&mut pwfx)
-            .context("GetMixFormat 失败")?;
+        audio_client.GetMixFormat(&mut pwfx).context("GetMixFormat 失败")?;
         if pwfx.is_null() {
             return Err(anyhow!(E_POINTER));
         }
         let (tag, in_channels, in_sr, in_bps) = parse_mix_format(pwfx)?;
 
-        // shared + loopback
-        // buffer duration: 100ms
-        let hns_buffer_duration: i64 = 1_000_000; // 100ms in 100ns units
+        let hns_buffer_duration: i64 = 1_000_000; // 100ms
         audio_client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -153,3 +141,28 @@ fn main() -> Result<()> {
 
         while running.load(Ordering::SeqCst) {
             let mut packet_len: u32 = capture_client
+                .GetNextPacketSize()
+                .context("GetNextPacketSize 失败")?;
+
+            while packet_len > 0 {
+                let (data_ptr, num_frames, flags, _devpos, _qpcpos) = capture_client
+                    .GetBuffer()
+                    .context("GetBuffer 失败")?;
+
+                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
+
+                let mut stereo_f32: Vec<(f32, f32)> = Vec::with_capacity(num_frames as usize);
+
+                if silent || data_ptr.is_null() {
+                    stereo_f32.resize(num_frames as usize, (0.0, 0.0));
+                } else if tag == WAVE_FORMAT_IEEE_FLOAT && in_bps == 32 {
+                    let fptr = data_ptr as *const f32;
+                    for i in 0..(num_frames as usize) {
+                        let base = i * (in_channels as usize);
+                        let l = *fptr.add(base);
+                        let r = if in_channels >= 2 { *fptr.add(base + 1) } else { l };
+                        stereo_f32.push((l, r));
+                    }
+                } else if tag == WAVE_FORMAT_PCM && in_bps == 16 {
+                    let sptr = data_ptr as *const i16;
+                    for i in 
